@@ -1,0 +1,14 @@
+[project]
+name = "md-sp-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=3.0.1",
+    "pymysql>=1.1.2",
+    "python-amazon-sp-api>=2.1.8",
+    "python-dotenv>=1.2.2",
+    "requests>=2.32.5",
+    "sqlalchemy>=2.0.48",
+]
