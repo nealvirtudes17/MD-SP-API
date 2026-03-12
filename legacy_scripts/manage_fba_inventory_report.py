@@ -112,7 +112,7 @@ try:
                 'ASIN': row['asin'],
                 'ProductName': row['product-name'],
                 'ItemCondition': row['condition'],
-                'YourPrice': float(row['your-price'] or '0'),
+                'YourPrice': float(row['your-price']),
                 'MFNListingExist': row['mfn-listing-exists'] == 'Yes',
                 'mfnfulfillablequantity': row['mfn-fulfillable-quantity'] or None,
                 'afnlistingexists': row['afn-listing-exists'] == 'Yes',

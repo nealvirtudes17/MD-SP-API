@@ -4,7 +4,7 @@ import requests
 import gzip
 from typing import Optional
 
-from sp_api.api import Reports, Finances
+from sp_api.api import Reports, Finances, Catalog, FbaSmallAndLight
 from sp_api.base import Marketplaces, ProcessingStatus
 from app.config import Config
 
@@ -45,8 +45,19 @@ def fetch_sp_api_report(report_type: str, start_date: Optional[str] = None, end_
         try:
             return gzip.decompress(download_res.content).decode('utf-8')
         except Exception:
-            # Fallback for reserved inventory legacy encoding
+            # Fallback for reserved inventory and manage fba legacy encoding
             return download_res.content.decode('cp1252', errors='ignore')
+
+def get_catalog_item(sku: str):
+    """Fetches synchronous catalog data for a specific SKU."""
+    client = Catalog(credentials=Config.get_sp_api_credentials(), marketplace=Marketplaces.DE)
+    # A1PA6795UKMFR9 is the specific MarketplaceId for Amazon Germany (DE)
+    return client.list_items(MarketplaceId='A1PA6795UKMFR9', SellerSKU=sku)
+
+def get_snl_enrollment(sku: str):
+    """Fetches FBA Small and Light enrollment status for a specific SKU."""
+    client = FbaSmallAndLight(credentials=Config.get_sp_api_credentials(), marketplace=Marketplaces.DE)
+    return client.get_small_and_light_enrollment_by_seller_sku(sku)
 
 def get_financial_events(posted_after: str, posted_before: str):
     """Fetches financial events (transactions) from the Finances API."""
