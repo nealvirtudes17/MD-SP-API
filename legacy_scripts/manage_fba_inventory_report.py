@@ -1,3 +1,6 @@
+#Manage FBA Report
+
+# %run ./keys.ipynb
 
 from sp_api.api import Reports
 from sp_api.base import Marketplaces, ReportType, ProcessingStatus, Granularity
@@ -18,18 +21,35 @@ pymysql.install_as_MySQLdb()
 start_time = time.time()
 
 CLIENT_CONFIG = {
-  "lwa_app_id": "",
+  }
 
-  "aws_access_key": "",
-  "aws_secret_key": "",
-  "role_arn": "",
-  "refresh_token": ""
-}
+skus_manage_fba = ['DE-SHADE-FOREST-S&L',
+        'DE-SHADE-FOREST',
+        'DE-SHADE-NOPRINT-S&L',
+        'DE-SHADE-NOPRINT',
+        'DE-SHADE-SEALIFE',
+        'DE-SHADE-SEALIFE-S&L',
+        'DE-SHADE-WILDLIFE',
+        'DE-SHADE-WILDLIFE-S&L',
+        'SHADE-WILDLIFE-DARK',
+        'SHADE-WILDLIFE-DARK-S&L',
+        'SHADE-BLACK-DARK',
+        'SHADE-BLACK-DARK-S&L',
+        'U6-BOU6-LX95',
+        '6W-V6GS-CRXQ',
+        'BND-KICKMAT1-SHADES',
+        'CA-3X7Q-WLRR',
+        'DE-SHADE-BLACK-S&L',
+        'DE-SHADE-FAIRIES-S&L',
+        'DE-SHADE-SPACE-S&L',
+        'SEAT-PROTECTOR-GREY',
+        'Z0-BQXD-9XGD',
+        'TRAVEL-TRAY-BLACK']
 
 try:
-    engine = create_engine("db credentials")
+    engine = create_engine()
 
-    existing_dates = pd.read_sql_table('Reserved_Inventory', con=engine)
+    existing_dates = pd.read_sql_table('Manage_FBA_Inventory', con=engine)
     existing_dates_list = [str(d) for d in existing_dates['DateStamp'].values]
     #today = date.today().strftime('%Y-%m-%d')
 
@@ -44,7 +64,7 @@ try:
 
     else:
 
-        report_type = ReportType.GET_RESERVED_INVENTORY_DATA
+        report_type = ReportType.GET_FBA_MYI_ALL_INVENTORY_DATA
         res = Reports(credentials=CLIENT_CONFIG, marketplace=Marketplaces.DE)
 
         data = res.create_report(reportType=report_type)
@@ -65,8 +85,8 @@ try:
             time.sleep(5)
             data = res.get_report(report_id)
         if data.payload.get('processingStatus') in [ProcessingStatus.FATAL, ProcessingStatus.CANCELLED]:
-                print("Report failed!")
-                report_data = data.payload
+            print("Report failed!")
+            report_data = data.payload
         else:
             print("Success:")
             print(data.payload)
@@ -81,6 +101,7 @@ try:
         decoded_content = res.content.decode('cp1252')
         reader = csv.DictReader(decoded_content.splitlines(), delimiter='\t')
 
+        today = date.today().strftime('%Y-%m-%d')
 
         data_list = []
         for row in reader:
@@ -90,20 +111,32 @@ try:
                 'FNSKU': row['fnsku'],
                 'ASIN': row['asin'],
                 'ProductName': row['product-name'],
-                'ReservedQTY': row['reserved_qty'],
-                'ReservedCustomerOrders': row['reserved_fc-transfers'],
-                'ReservedFCtransfer': row['reserved_fc-transfers'],
-                'ReservedFCprocessing': row['reserved_fc-processing'],
+                'ItemCondition': row['condition'],
+                'YourPrice': float(row['your-price'] or '0'),
+                'MFNListingExist': row['mfn-listing-exists'] == 'Yes',
+                'mfnfulfillablequantity': row['mfn-fulfillable-quantity'] or None,
+                'afnlistingexists': row['afn-listing-exists'] == 'Yes',
+                'afnwarehousequantity': row['afn-warehouse-quantity'],
+                'afnfulfillablequantity': row['afn-fulfillable-quantity'],
+                'afnunsellablequantity': row['afn-unsellable-quantity'],
+                'afnreservedquantity': row['afn-reserved-quantity'],
+                'afntotalquantity': row['afn-total-quantity'],
+                'perunitvolume': float(row['per-unit-volume']) if row['per-unit-volume'] else None,
+                'afninboundworkingquantity': row['afn-inbound-working-quantity'],
+                'afninboundshippedquantity': row['afn-inbound-shipped-quantity'],
+                'afninboundreceivingquantity': row['afn-inbound-receiving-quantity'],
+                'afnresearchingquantity': row['afn-researching-quantity'],
+                'afnreservedfuturesupply': row['afn-reserved-future-supply'],
+                'afnfuturesupplybuyable': row['afn-future-supply-buyable'],
+
             }
             data_list.append(data)
 
         df = pd.DataFrame(data_list)
 
-        df.to_sql(name='Reserved_Inventory',con=engine,if_exists='append', index=False)
+        filtered_df = df[df['SKU'].isin(skus_manage_fba)]
 
-        #filtered_df = df[df['SKU'].isin(skus_manage_fba)]
-
-        #filtered_df.to_sql(name='Manage_FBA_Inventory',con=engine,if_exists='append', index=False)
+        filtered_df.to_sql(name='Manage_FBA_Inventory',con=engine,if_exists='append', index=False)
 
         print("Gathering and appending of data completed without errors")
 
@@ -111,6 +144,6 @@ except Exception as e:
     print("An error occurred: ", e)
 
 finally:
-    print("Running of reserved inventory data is completed after %s seconds" % (time.time() - start_time))
+    print("Running of manage_fba check is completed after %s seconds" % (time.time() - start_time))
 
 engine.dispose()

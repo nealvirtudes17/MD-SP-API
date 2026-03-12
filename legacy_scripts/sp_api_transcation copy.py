@@ -399,7 +399,7 @@ d2_del = d_now_del - timedelta(del_start)
 #Delete Data
 d2_del_F = d2_del.strftime('%Y-%m-%d')
 
-engine = create_engine("mysql://web83_4:BKRjP7G8m2yqkbMV@s95.goserver.host/web83_db4?charset=utf8")
+engine = create_engine("")
 
 
 

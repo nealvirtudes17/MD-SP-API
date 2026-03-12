@@ -1,22 +1,20 @@
 import csv
-import gzip
 import logging
 from datetime import datetime, timedelta, date
 
 import pandas as pd
-import requests
+import numpy as np
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-# Import from our centralized app modules
 from app.database import engine
 from app.api_client import fetch_sp_api_report
 from sp_api.base import ReportType
 
 logger = logging.getLogger(__name__)
 
-def get_report_dates() -> tuple[str, str, str]:
-    """Calculates API boundaries and SQL deletion cutoffs based on the day of the week."""
+def get_sync_parameters() -> tuple[str, str, str]:
+    """Calculates API boundaries and SQL deletion cutoffs."""
     day = datetime.now().strftime('%A')
     
     if day in ['Monday', 'Wednesday', 'Thursday']:
@@ -24,9 +22,9 @@ def get_report_dates() -> tuple[str, str, str]:
     else:
         api_start, api_end, del_start = 2, 1, 1
 
-    dateas = datetime.now() + timedelta(hours=8)
-    s_date = datetime.strftime(dateas - timedelta(api_start), '%Y-%m-%d') + 'T22:00:00.000Z'
-    e_date = datetime.strftime(datetime.now() - timedelta(api_end), '%Y-%m-%d') + 'T22:00:00.000Z'
+    now_tz = datetime.now() + timedelta(hours=8)
+    s_date = (now_tz - timedelta(api_start)).strftime('%Y-%m-%d') + 'T22:00:00.000Z'
+    e_date = (datetime.now() - timedelta(api_end)).strftime('%Y-%m-%d') + 'T22:00:00.000Z'
     
     cutoff_date = date.today() - timedelta(del_start)
     cutoff_dt = datetime.combine(cutoff_date, datetime.min.time()) + timedelta(hours=6)
@@ -34,20 +32,23 @@ def get_report_dates() -> tuple[str, str, str]:
     return s_date, e_date, cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def transform_data(decoded_content: str) -> pd.DataFrame:
-    """Cleans and formats the raw TSV string into a DataFrame."""
+    """Transforms raw TSV data using Pandas (Schema-Agnostic)."""
     reader = csv.DictReader(decoded_content.splitlines(), delimiter='\t')
     df = pd.DataFrame(reader)
 
     if df.empty:
-        logger.warning("Empty DataFrame received. Skipping transformation.")
         return df
 
+    # 1. Clean Core Identifiers
     df['amazon-order-id'] = df['amazon-order-id'].str.lstrip("\n")
+    
+    # 2. Date Normalization (Matching your legacy script exactly)
     df['purchase-date'] = pd.to_datetime(df['purchase-date'], errors='coerce') + timedelta(hours=8)
     df['purchase-date'] = df['purchase-date'].dt.tz_localize(None)
-    df['purchaseDate'] = df['purchase-date']
+    df['purchaseDate'] = df['purchase-date']  # Duplicate for the database column match
     
-    df = df[:-1] 
+    # 3. Drop trailing summary row and format specific columns
+    df = df[:-1]
     
     if 'is-iba' in df.columns:
         df['is-sold-by-ab'] = df['is-iba']
@@ -58,51 +59,37 @@ def transform_data(decoded_content: str) -> pd.DataFrame:
     if 'buyer-citizen-id ' in df.columns:
         df = df.rename(columns={'buyer-citizen-id ': 'buyer-citizen-id'})
 
-    return df
-
-def load_data(df: pd.DataFrame, cutoff_dt_str: str):
-    """Executes the legacy delete constraint and loads new data via explicit transaction."""
-    if df.empty:
-        logger.info("No data to load for All Orders.")
-        return
-
-    try:
-        # 2.0 Standard: explicit begin() for transactional safety
-        with engine.begin() as conn:
-            logger.info(f"Deleting old records where purchaseDate > {cutoff_dt_str}")
-            stmt = text("DELETE FROM All_Orders WHERE purchaseDate > :cutoff_date")
-            conn.execute(stmt, {"cutoff_date": cutoff_dt_str})
-            
-            logger.info(f"Appending {len(df)} new records to All_Orders.")
-            # Eventually, this .to_sql should be replaced by session.execute(insert()) using the ORM
-            df.to_sql(name='All_Orders', con=conn, if_exists='append', index=False)
-            
-    except SQLAlchemyError as e:
-        logger.error(f"Database operation failed for All Orders: {e}")
-        raise
+    # 4. Fill NaNs to prevent SQL insertion errors
+    return df.replace({np.nan: None})
 
 def execute_sync():
-    """Main execution function called by the orchestrator."""
-    logger.info("Starting All Orders sync...")
-    s_date, e_date, cutoff_dt_str = get_report_dates()
+    logger.info("Starting All Orders synchronization...")
+    s_date, e_date, cutoff_str = get_sync_parameters()
     
-    # 1. Fetch Report URL using our shared API client
-    report_url = fetch_sp_api_report(
-        report_type=ReportType.GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL,
-        start_date=s_date,
-        end_date=e_date
-    )
-    
-    # 2. Download & Decode
-    res = requests.get(report_url)
     try:
-        decoded_content = res.content.decode('utf-8')
-    except UnicodeDecodeError:
-        decoded_content = gzip.decompress(res.content).decode('utf-8')
+        # Step 1: Fetch and Decode Report via Shared API Client
+        content = fetch_sp_api_report(
+            ReportType.GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL,
+            s_date, e_date
+        )
 
-    # 3. Transform
-    clean_df = transform_data(decoded_content)
-    
-    # 4. Load
-    load_data(clean_df, cutoff_dt_str)
-    logger.info("All Orders sync complete.")
+        # Step 2: Transform
+        clean_df = transform_data(content)
+        
+        if clean_df.empty:
+            logger.info("No records found to sync.")
+            return
+
+        with engine.begin() as conn:
+            logger.info(f"Clearing existing data after {cutoff_str}...")
+            delete_stmt = text("DELETE FROM All_Orders WHERE purchaseDate > :cutoff")
+            conn.execute(delete_stmt, {"cutoff": cutoff_str})
+            
+            logger.info(f"Appending {len(clean_df)} records to All_Orders...")
+            clean_df.to_sql(name='All_Orders', con=conn, if_exists='append', index=False)
+            
+        logger.info("Sync completed successfully.")
+
+    except (SQLAlchemyError, Exception) as e:
+        logger.error(f"Sync failed: {str(e)}")
+        raise
