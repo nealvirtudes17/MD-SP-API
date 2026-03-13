@@ -108,7 +108,6 @@ def get_payment_details(x,event, quantity):
         Payment_detail = x
         Quantity = ''
 
-#     print(Payment_type, Payment_detail, Quantity)
 
     return {
         'payment_type':Payment_type,

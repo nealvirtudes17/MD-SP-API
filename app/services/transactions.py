@@ -1,283 +1,327 @@
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Tuple
+import time
+from datetime import datetime, timedelta, date
 
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from sp_api.base.exceptions import SellingApiException
+from sp_api.api import Finances
+from sp_api.base import Marketplaces
 
 from app.database import engine
-from app.api_client import get_financial_events
+from app.api_client import Config
 
 logger = logging.getLogger(__name__)
 
-# --- 1. Core Mapping Logic ---
 
-def get_payment_details(charge_type: str, quantity: Any) -> Tuple[str, str, Any]:
-    """
-    Replaces the legacy 16-clause if/elif block with an O(1) hash map lookup.
-    Maps Amazon API charge types to internal accounting categorizations.
-    """
-    mapping = {
-        'Principal': ('Product charges', '', quantity),
-        'Tax': ('Other', 'Product Tax', ''),
-        'FBAPerUnitFulfillmentFee': ('Amazon fees', 'FBA fulfilment fee per unit', ''),
-        'Commission': ('Amazon fees', 'Commission', ''),
-        'RefundCommission': ('Amazon fees', 'Refund Commission', ''),
-        'REVERSAL_REIMBURSEMENT': ('Other', 'Reversal Reimbursement', ''),
-        'FBA storage fee': ('Amazon fees', 'FBA storage fee', ''),
-        'WAREHOUSE_DAMAGE_INVENTORY': ('Other', 'WAREHOUSE_DAMAGE_INVENTORY', quantity),
-        'StorageRenewalBilling': ('Amazon fees', 'StorageRenewalBilling', ''),
-        'StorageBilling': ('Amazon fees', 'StorageBilling', ''),
-        'GIFTWRAP': ('Other', 'GIFTWRAP', ''),
-        'Goodwill': ('Other', 'Goodwill', ''),
-        'ShippingCharge': ('Other', 'ShippingCharge', ''),
-        'ShippingTax': ('Other', 'ShippingTax', ''),
-        'FBA transportation fee': ('Amazon fees', 'FBA transportation fee', ''),
-        'ReturnShipping': ('Amazon fees', 'ReturnShipping', '')
+CHARGE_TYPE_MAP = {
+    'Principal': ('Product charges', '', True),
+    'Tax': ('Other', 'Product Tax', False),
+    'FBAPerUnitFulfillmentFee': ('Amazon fees', 'FBA fulfilment fee per unit', False),
+    'Commission': ('Amazon fees', 'Commission', False),
+    'RefundCommission': ('Amazon fees', 'Refund Commission', False),
+    'REVERSAL_REIMBURSEMENT': ('FBA Inventory Reimbursement - Customer Return', '', True),
+    'WAREHOUSE_DAMAGE': ('FBA Inventory Reimbursement - Damaged:Warehouse', '', True),
+    'WAREHOUSE_LOST_MANUAL': ('FBA Inventory Reimbursement - Lost:Warehouse', '', True),
+    'RunLightningDealFee': ('Amazon fees', 'Lightning Deal Fee', True),
+    'FBAStorageFee': ('Amazon fees', 'FBA storage fee', True),
+    'FBALongTermStorageFee': ('Amazon fees', 'FBA Long-Term Storage Fee', True),
+    'Subscription': ('Amazon fees', 'Subscription', True),
+    'FBAInboundTransportationFee': ('Amazon fees', 'Inbound Transportation Fee', True),
+    'LabelingFee': ('Amazon fees', 'Labeling Fee', True),
+    'FBAInboundTransportationProgramFee': ('Amazon fees', 'Inbound Transportation Program Fee', True),
+    'CouponRedemptionFee': ('Amazon fees', 'Coupon Redemption Fee', False)
+}
+
+def get_mapped_details(raw_type: str, quantity: int) -> dict:
+    """Uses the mapping dictionary to return standardized payment details."""
+    p_type, p_detail, inc_qty = CHARGE_TYPE_MAP.get(raw_type, ('Other', raw_type, False))
+    return {
+        'PaymentType': p_type,
+        'PaymentDetail': p_detail,
+        'Quantity': quantity if inc_qty else 0
     }
-    return mapping.get(charge_type, ('Other', charge_type, quantity))
 
-# --- 2. Deep Nested JSON Extraction ---
+# ==============================================================================
+# EVENT PARSERS 
+# PURPOSE: To "flatten" Amazon's deeply nested JSON tree into standard database rows.
+# ==============================================================================
 
-def parse_shipment_events(events: List[Dict]) -> List[Dict]:
-    """Parses Order/Shipment transactions."""
-    records = []
-    for event in events:
-        date_val = event.get('PostedDate')
-        marketplace = event.get('MarketplaceName')
-        order_id = event.get('AmazonOrderId')
-        
-        for item in event.get('ShipmentItemList', []):
-            sku = item.get('SellerSKU', '')
-            qty = item.get('QuantityShipped', 1)
-            
-            # Extract Charges (e.g., Principal, Tax)
-            for charge in item.get('ItemChargeList', []):
-                ctype = charge.get('ChargeType', '')
-                amount = float(charge.get('ChargeAmount', {}).get('CurrencyAmount', 0.0))
-                p_type, p_detail, p_qty = get_payment_details(ctype, qty)
-                
-                records.append({
-                    'Date': date_val, 'Marketplace': marketplace, 'Order ID': order_id,
-                    'Type': 'Order', 'Payment Type': p_type, 'Payment Detail': p_detail,
-                    'Amount': amount, 'Quantity': p_qty, 'SKU': sku, 'Description': ''
-                })
-                
-            # Extract Fees (e.g., Commission, FBA fees)
-            for fee in item.get('ItemFeeList', []):
-                ftype = fee.get('FeeType', '')
-                amount = float(fee.get('FeeAmount', {}).get('CurrencyAmount', 0.0))
-                p_type, p_detail, p_qty = get_payment_details(ftype, qty)
-                
-                records.append({
-                    'Date': date_val, 'Marketplace': marketplace, 'Order ID': order_id,
-                    'Type': 'Order', 'Payment Type': p_type, 'Payment Detail': p_detail,
-                    'Amount': amount, 'Quantity': p_qty, 'SKU': sku, 'Description': ''
-                })
-    return records
-
-def parse_refund_events(events: List[Dict]) -> List[Dict]:
-    """Parses Refund transactions."""
-    records = []
-    for event in events:
-        date_val = event.get('PostedDate')
-        marketplace = event.get('MarketplaceName')
-        order_id = event.get('AmazonOrderId')
-        
-        for item in event.get('ShipmentItemAdjustmentList', []):
-            sku = item.get('SellerSKU', '')
-            qty = item.get('QuantityShipped', 1)
-            
-            # Extract Refund Charges
-            for charge in item.get('ItemChargeAdjustmentList', []):
-                ctype = charge.get('ChargeType', '')
-                amount = float(charge.get('ChargeAmount', {}).get('CurrencyAmount', 0.0))
-                p_type, p_detail, p_qty = get_payment_details(ctype, qty)
-                
-                records.append({
-                    'Date': date_val, 'Marketplace': marketplace, 'Order ID': order_id,
-                    'Type': 'Refund', 'Payment Type': p_type, 'Payment Detail': p_detail,
-                    'Amount': amount, 'Quantity': p_qty, 'SKU': sku, 'Description': ''
-                })
-                
-            # Extract Refund Fees
-            for fee in item.get('ItemFeeAdjustmentList', []):
-                ftype = fee.get('FeeType', '')
-                amount = float(fee.get('FeeAmount', {}).get('CurrencyAmount', 0.0))
-                p_type, p_detail, p_qty = get_payment_details(ftype, qty)
-                
-                records.append({
-                    'Date': date_val, 'Marketplace': marketplace, 'Order ID': order_id,
-                    'Type': 'Refund', 'Payment Type': p_type, 'Payment Detail': p_detail,
-                    'Amount': amount, 'Quantity': p_qty, 'SKU': sku, 'Description': ''
-                })
-                
-            # Extract Promotions
-            for promo in item.get('PromotionAdjustmentList', []):
-                desc = promo.get('PromotionId', '')
-                amount = float(promo.get('PromotionAmount', {}).get('CurrencyAmount', 0.0))
-                p_type, p_detail, p_qty = get_payment_details('Promotion', qty)
-                
-                records.append({
-                    'Date': date_val, 'Marketplace': marketplace, 'Order ID': order_id,
-                    'Type': 'Refund', 'Payment Type': p_type, 'Payment Detail': p_detail,
-                    'Amount': amount, 'Quantity': p_qty, 'SKU': sku, 'Description': desc
-                })
-    return records
-
-def parse_service_fee_events(events: List[Dict]) -> List[Dict]:
-    """Parses Account-level Service Fees (e.g., Subscriptions, Storage)."""
-    records = []
-    for event in events:
-        date_val = event.get('CreationDate')
-        marketplace = ''
-        order_id = ''
-        sku = event.get('SellerSKU', '')
-        desc = event.get('FeeReason', '')
-        
-        for fee in event.get('FeeList', []):
-            ftype = fee.get('FeeType', '')
-            amount = float(fee.get('FeeAmount', {}).get('CurrencyAmount', 0.0))
-            p_type, p_detail, p_qty = get_payment_details(ftype, '')
-            
-            records.append({
-                'Date': date_val, 'Marketplace': marketplace, 'Order ID': order_id,
-                'Type': ftype, 'Payment Type': p_type, 'Payment Detail': p_detail,
-                'Amount': amount, 'Quantity': p_qty, 'SKU': sku, 'Description': desc
-            })
-    return records
-
-def parse_adjustment_events(events: List[Dict]) -> List[Dict]:
-    """Parses FBA Inventory Adjustments (e.g., Lost/Damaged)."""
-    records = []
-    for event in events:
-        date_val = event.get('PostedDate')
-        adj_type = event.get('AdjustmentType', '')
-        
-        for item in event.get('AdjustmentItemList', []):
-            sku = item.get('SellerSKU', '')
-            qty = item.get('Quantity', '')
-            desc = item.get('ProductDescription', '')
-            amount = float(item.get('PerUnitAmount', {}).get('CurrencyAmount', 0.0))
-            p_type, p_detail, p_qty = get_payment_details(adj_type, qty)
-            
-            records.append({
-                'Date': date_val, 'Marketplace': '', 'Order ID': '',
-                'Type': adj_type, 'Payment Type': p_type, 'Payment Detail': p_detail,
-                'Amount': amount, 'Quantity': p_qty, 'SKU': sku, 'Description': desc
-            })
-    return records
-
-# --- 3. Main ETL Pipeline Logic ---
-
-def get_sync_window() -> Tuple[str, str, str]:
-    """Calculates synchronization boundaries to ensure seamless overlapping updates."""
-    with engine.connect() as conn:
-        stmt = text("SELECT MAX(Date) FROM Transaction_report")
-        max_date_val = conn.execute(stmt).scalar()
-
-    now = datetime.utcnow()
-    posted_before = (now - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    if max_date_val:
-        # Support both string and datetime returns from different DB dialects
-        if isinstance(max_date_val, str):
-            max_date = datetime.strptime(max_date_val[:10], "%Y-%m-%d")
-        else:
-            max_date = max_date_val
-            
-        posted_after_dt = max_date - timedelta(days=2)
-        posted_after = posted_after_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        cutoff_str = posted_after_dt.strftime("%Y-%m-%d")
-    else:
-        # Default 30-day backfill if the table is completely empty
-        posted_after_dt = now - timedelta(days=30)
-        posted_after = posted_after_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        cutoff_str = posted_after_dt.strftime("%Y-%m-%d")
-
-    return posted_after, posted_before, cutoff_str
-
-def transform_data(raw_items: List[Dict]) -> pd.DataFrame:
-    """Consolidates and formats the final Pandas DataFrame."""
-    if not raw_items:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(raw_items)
-
-    # 1. Strict Legacy Filtering: Keep only German Marketplace and Account-level events
-    if 'Marketplace' in df.columns:
-        df = df[df['Marketplace'].isin(['Amazon.de', ''])]
-        df = df.drop(columns=['Marketplace'])
-
-    # 2. Text Cleaning
-    df = df.replace({'&amp;': '&'}, regex=True)
+def parse_shipment_event(event: dict) -> tuple[list, str]:
+    """Flattens ShipmentEventList into database-ready rows."""
+    rows = []
     
-    # 3. Timezone Adjustment & Formatting (UTC to CET +2 hours)
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce') + timedelta(hours=2)
-        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
+    # 1. Extract Top-Level Shipment Data
+    order_id = event.get('AmazonOrderId', '')
+    posted_date = event.get('PostedDate')
+    marketplace = event.get('MarketplaceName', '')
 
-    # 4. Numeric Enforcement
-    if 'Quantity' in df.columns:
-        df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
+    # 2. Extract Item-Level Data
+    for item in event.get('ShipmentItemList', []):
+        sku = item.get('SellerSKU', '')
+        qty = item.get('QuantityShipped', 0)
+        
+        # We loop dynamically through Charges and Fees
+        for list_name, item_type in [('ItemChargeList', 'ChargeType'), ('ItemFeeList', 'FeeType')]:
+            for charge in item.get(list_name, []):
+                amt = charge.get(item_type.replace('Type', 'Amount'), {}).get('CurrencyAmount', 0)
+                if amt == 0:
+                    continue
+                    
+                mapped = get_mapped_details(charge[item_type], qty)
+                
+                rows.append({
+                    'Date': posted_date, 
+                    'Marketplace': marketplace, 
+                    'Order ID': order_id,           # Fixed space
+                    'SKU': sku, 
+                    'Transaction type': 'Order Payment', # Fixed space and casing
+                    'Payment Type': mapped['PaymentType'], # Fixed space
+                    'Payment Detail': mapped['PaymentDetail'], # Fixed space
+                    'Amount': amt, 
+                    'Quantity': mapped['Quantity'], 
+                    'Product Title': ''             # Fixed space
+                })
+                
+        # Parse Promotions
+        for promo in item.get('PromotionList', []):
+            amt = promo.get('PromotionAmount', {}).get('CurrencyAmount', 0)
+            if amt == 0:
+                continue
+                
+            mapped = get_mapped_details(promo.get('PromotionId', ''), qty)
+            
+            rows.append({
+                'Date': posted_date, 
+                'Marketplace': marketplace, 
+                'Order ID': order_id, 
+                'SKU': sku, 
+                'Transaction type': 'Order Payment', 
+                'Payment Type': mapped['PaymentType'], 
+                'Payment Detail': mapped['PaymentDetail'], 
+                'Amount': amt, 
+                'Quantity': mapped['Quantity'], 
+                'Product Title': ''
+            })
 
-    return df
+    return rows, posted_date
+
+
+def parse_refund_event(event: dict) -> list:
+    """Flattens RefundEventList."""
+    rows = []
+    
+    #Extract Top data level with .get()
+    order_id = event.get('AmazonOrderId', '')
+    posted_date = event.get('PostedDate')
+    marketplace = event.get('MarketplaceName', '')
+
+    #loop through the items (defaults to empty list if missing)
+    for item in event.get('ShipmentItemAdjustmentList', []):
+        sku = item.get('SellerSKU', '')
+        qty = item.get('QuantityShipped', 0)
+
+        #Loop for both Charges and Fees
+        for list_name, item_type in [('ItemChargeAdjustmentList', 'ChargeType'), ('ItemFeeAdjustmentList', 'FeeType')]:
+            for charge in item.get(list_name, []):
+                amt = charge.get(item_type.replace('Type', 'Amount'), {}).get('CurrencyAmount', 0)
+                if amt == 0:
+                    continue
+        
+                mapped = get_mapped_details(charge[item_type], qty)
+    
+                rows.append({
+                    'Date': posted_date, 
+                    'Marketplace': marketplace, 
+                    'Order ID': order_id, 
+                    'SKU': sku, 
+                    'Transaction type': 'Refund', 
+                    'Payment Type': mapped['PaymentType'], 
+                    'Payment Detail': mapped['PaymentDetail'], 
+                    'Amount': amt, 
+                    'Quantity': mapped['Quantity'], 
+                    'Product Title': ''
+                })
+    return rows
+
+
+def parse_service_fee_event(event: dict, fallback_date: str) -> list:
+    """Flattens ServiceFeeEventList. Uses fallback_date if none is provided by Amazon."""
+    rows = []
+    
+    # Loop through the fees, default is zero if not found
+    for fee in event.get('FeeList', []):
+        
+        amt = fee.get('FeeAmount', {}).get('CurrencyAmount', 0)
+        
+        #Added a guard clause to skip zero amounts
+        if amt == 0:
+            continue
+            
+        
+        mapped = get_mapped_details(fee.get('FeeType', ''), 0)
+        
+        rows.append({
+            'Date': fallback_date, 
+            'Marketplace': '', 
+            'Order ID': '', 
+            'SKU': '', 
+            'Transaction type': 'Service Fees', 
+            'Payment Type': mapped['PaymentType'], 
+            'Payment Detail': mapped['PaymentDetail'], 
+            'Amount': amt, 
+            'Quantity': mapped['Quantity'], 
+            'Product Title': ''
+        })
+        
+    return rows
+
+
+def parse_adjustment_event(event: dict) -> list:
+    """
+    Flattens AdjustmentEventList. 
+    Handles both Global Adjustments and Item-Level Adjustments.
+    """
+    rows = []
+    posted_date = event.get('PostedDate')
+    adj_type = event.get('AdjustmentType', '')
+    
+    items = event.get('AdjustmentItemList', [])
+    
+    if items:
+        # Handling adjustment evenst that are tied to an SKU
+        for item in items:
+            sku = item.get('SellerSKU', '')
+            qty = item.get('Quantity', 0)
+            amt = item.get('TotalAmount', {}).get('CurrencyAmount', 0)
+            
+            # Translate using the specific quantity for this item
+            mapped = get_mapped_details(adj_type, qty)
+            
+            # SCHEMA FIX: Keys exactly match legacy df_cols
+            rows.append({
+                'Date': posted_date, 
+                'Marketplace': '', 
+                'Order ID': '', 
+                'SKU': sku, 
+                'Transaction type': 'Other', 
+                'Payment Type': mapped['PaymentType'], 
+                'Payment Detail': mapped['PaymentDetail'], 
+                'Amount': amt, 
+                'Quantity': mapped['Quantity'], 
+                'Product Title': ''
+            })
+    else:
+        # Handling global adjustments
+        amt = event.get('AdjustmentAmount', {}).get('CurrencyAmount', 0)
+        mapped = get_mapped_details(adj_type, 0)
+        
+        # SCHEMA FIX: Keys exactly match legacy df_cols
+        rows.append({
+            'Date': posted_date, 
+            'Marketplace': '', 
+            'Order ID': '', 
+            'SKU': '', 
+            'Transaction type': 'Other', 
+            'Payment Type': mapped['PaymentType'], 
+            'Payment Detail': mapped['PaymentDetail'], 
+            'Amount': amt, 
+            'Quantity': mapped['Quantity'], 
+            'Product Title': ''
+        })
+        
+    return rows
+
+
+# ==============================================================================
+# MAIN ETL and Pagination management of API
+# ==============================================================================
+
+def get_sync_parameters() -> tuple[str, str, str]:
+    """Calculates strict API boundaries and DB purge cutoffs with UTC+8 sync."""
+    day = datetime.now().strftime('%A')
+    
+    if day in ['Monday', 'Wednesday', 'Thursday']:
+        api_start = 31
+        api_end = 1
+        del_start = 30
+    else:
+        api_start = 8
+        api_end = 1
+        del_start = 7
+
+    now = datetime.now()
+
+    #Calculate API Boundaries (UTC)
+    yesterday_date = (now - timedelta(days=api_start)).strftime('%Y-%m-%d')
+    current_date = (now - timedelta(days=api_end)).strftime('%Y-%m-%d')
+    
+    s_date = f"{yesterday_date}T22:00:00.000Z"
+    e_date = f"{current_date}T22:00:00.000Z"
+    
+    #Calculate Database Purge Date (Local Time UTC+8)
+    #Explicitly added 06:00:00 to perfectly align with 22:00:00 UTC
+    d_now_del = date.today()
+    d2_del = d_now_del - timedelta(days=del_start)
+    cutoff_str = f"{d2_del.strftime('%Y-%m-%d')} 06:00:00"
+    
+    return s_date, e_date, cutoff_str
+
+
 
 def execute_sync():
-    """Main Orchestration point for Transactions ETL."""
-    logger.info("Starting Transactions sync...")
+    logger.info("Starting Financial Transactions synchronization...")
+    s_date, e_date, cutoff_str = get_sync_parameters()
     
-    posted_after, posted_before, cutoff_str = get_sync_window()
-    logger.info(f"Fetching events from {posted_after} to {posted_before}")
-
-    all_raw_items = []
-    next_token = None
-    page_count = 0
-    MAX_PAGES = 50 # Fail-safe to prevent infinite API polling loops
-
     try:
-        # --- EXTRACT ---
-        while page_count < MAX_PAGES:
-            logger.info(f"Fetching Finances API page {page_count + 1}...")
-            
-            res = get_financial_events(posted_after, posted_before, next_token=next_token)
+        client = Finances(credentials=Config.get_sp_api_credentials(), marketplace=Marketplaces.DE)
+        all_events = []
+        last_seen_date = (datetime.now() + timedelta(hours=8)).strftime('%Y-%m-%dT00:00:00Z')
+        
+        res = client.list_financial_events(PostedAfter=s_date, PostedBefore=e_date)
+        while True:
             payload = res.payload.get('FinancialEvents', {})
             
-            # Extract and flatten all nested event arrays
-            all_raw_items.extend(parse_shipment_events(payload.get('ShipmentEventList', [])))
-            all_raw_items.extend(parse_refund_events(payload.get('RefundEventList', [])))
-            all_raw_items.extend(parse_service_fee_events(payload.get('ServiceFeeEventList', [])))
-            all_raw_items.extend(parse_adjustment_events(payload.get('AdjustmentEventList', [])))
-            
-            next_token = res.payload.get('NextToken')
-            if not next_token:
-                break
+            for event in payload.get('ShipmentEventList', []):
+                rows, date_last = parse_shipment_event(event)
+                all_events.extend(rows)
+                if date_last: 
+                    last_seen_date = date_last
+                    
+            for event in payload.get('RefundEventList', []):
+                all_events.extend(parse_refund_event(event))
                 
-            page_count += 1
+            for event in payload.get('ServiceFeeEventList', []):
+                all_events.extend(parse_service_fee_event(event, last_seen_date))
+                
+            for event in payload.get('AdjustmentEventList', []):
+                all_events.extend(parse_adjustment_event(event))
+            
+            next_token = res.pagination.get('NextToken') if hasattr(res, 'pagination') else None
+            if not next_token: break
+            res = client.list_financial_events(NextToken=next_token)
 
-        # --- TRANSFORM ---
-        clean_df = transform_data(all_raw_items)
-
-        if clean_df.empty:
-            logger.info("No transaction records found in this time window.")
+        df = pd.DataFrame(all_events)
+        if df.empty:
+            logger.info("No records found.")
             return
 
-        # --- LOAD ---
-        with engine.begin() as conn:
-            logger.info(f"Deleting overlapping records where Date >= {cutoff_str}")
-            delete_stmt = text("DELETE FROM Transaction_report WHERE Date >= :cutoff")
-            conn.execute(delete_stmt, {"cutoff": cutoff_str})
-            
-            logger.info(f"Appending {len(clean_df)} records to Transaction_report...")
-            clean_df.to_sql(name='Transaction_report', con=conn, if_exists='append', index=False)
-            
-        logger.info("Transactions sync completed successfully.")
+        df = df[df['Marketplace'].isin(['Amazon.de', ''])]
+        df = df.replace('&amp;',"&", regex=True)
+        df['Date'] = pd.to_datetime(df['Date'])
+        #Converting to local timezone (UTC+8)
+        df['Date'] = df['Date'] + pd.Timedelta(hours=8)
+        # 3. Strip timezone info but KEEP THE HOURS/MINUTES/SECONDS
+        df['Date'] = df['Date'].dt.tz_localize(None)
+        df.drop(columns=['Marketplace'], inplace=True, errors='ignore')
 
-    except SellingApiException as e:
-        logger.error(f"Amazon SP-API Error: {e}")
-        raise
-    except SQLAlchemyError as e:
-        logger.error(f"Database Integrity Error: {e}")
+        with engine.begin() as conn:
+            logger.info(f"Purging old transactions >= {cutoff_str}...")
+            conn.execute(text("DELETE FROM Transaction_report WHERE Date >= :cutoff"), {"cutoff": cutoff_str})
+            df.to_sql(name='Transaction_report', con=conn, if_exists='append', index=False)
+            
+        logger.info("Sync completed.")
+
+    except (SQLAlchemyError, Exception) as e:
+        logger.error(f"Sync failed: {str(e)}")
         raise

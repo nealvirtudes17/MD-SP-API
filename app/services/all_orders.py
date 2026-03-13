@@ -46,6 +46,10 @@ def transform_data(decoded_content: str) -> pd.DataFrame:
     df['purchase-date'] = pd.to_datetime(df['purchase-date'], errors='coerce') + timedelta(hours=8)
     df['purchase-date'] = df['purchase-date'].dt.tz_localize(None)
     df['purchaseDate'] = df['purchase-date']  # Duplicate for the database column match
+
+    df['last-updated-date'] = pd.to_datetime(df['last-updated-date'], errors='coerce') + timedelta(hours=8)
+    df['last-updated-date'] = df['last-updated-date'].dt.tz_localize(None)
+    df['last-updated-date'] = df['last-updated-datee'] 
     
     # 3. Drop trailing summary row and format specific columns
     df = df[:-1]
